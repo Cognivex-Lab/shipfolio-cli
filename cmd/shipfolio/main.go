@@ -10,11 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 
 	"github.com/Cognivex-Lab/shipfolio-cli/internal/cli"
 )
 
 func main() {
+	// Release builds set the version with -ldflags; "go install …@v1.2.3"
+	// records it in the build info instead.
+	if bi, ok := debug.ReadBuildInfo(); ok && cli.Version == "dev" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		cli.Version = bi.Main.Version
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	app := &cli.App{
