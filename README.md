@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="Shipfolio logo" width="64" height="64">
+
 # shipfolio
 
 The command-line client for [Shipfolio](https://shipfolio.ai): Search Console and GA4 numbers for every product you run, in your terminal, in scripts and in CSV.
