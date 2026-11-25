@@ -132,6 +132,22 @@ Shipfolio serves the same data over MCP at `https://api.shipfolio.ai/mcp`. Clien
 
 The REST API is described in OpenAPI 3.1 at <https://api.shipfolio.ai/openapi.json>.
 
+## SEO and GEO tasks
+
+Shipfolio audits each product's site the way search engines and AI assistants' crawlers read it, checks which pages Google has indexed, and turns what it finds (and what you add from opportunities and suggestions) into tasks, each with how to fix it.
+
+```console
+$ shipfolio tasks --product alpha.com
+ID          PRODUCT    LEVEL  TASK                                    WHERE                          STATUS
+tsk_25c7…   alpha.com  fail   OAI-SearchBot is blocked in robots.txt  https://alpha.com/robots.txt   open
+tsk_ec7f…   alpha.com  fail   Only 38 words without JavaScript        https://alpha.com/merge-pdf    open
+
+$ shipfolio tasks show tsk_25c7…     # with the fix, e.g. the robots.txt lines to add
+$ shipfolio tasks done tsk_25c7…     # Shipfolio compares the 28 days after with the 28 before
+```
+
+`shipfolio tasks --fix` prints every open task with its fix, which is a good brief for a coding agent working in the site's repository. `shipfolio audit PRODUCT` shows the latest audit (`--run` audits now), and `shipfolio suggest PRODUCT URL` asks Claude for a page's new title, description, sections, FAQ and structured data. Agents connected over MCP get the same through `get_tasks`.
+
 ## Configuration
 
 | Variable | Meaning |

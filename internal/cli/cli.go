@@ -76,6 +76,15 @@ Data:
   note add DATE TEXT         Annotate a day (DATE may be today)
   note rm ID                 Delete an annotation
 
+SEO and GEO:
+  tasks                      What to change on the sites, with how (--fix prints it)
+  tasks show ID              One task with its fix
+  tasks done ID...           Mark tasks done; Shipfolio measures the 28 days after
+  tasks dismiss|reopen ID... Dismiss or reopen tasks
+  tasks add PRODUCT TITLE    Add a task (--url, --query, --fix)
+  audit PRODUCT              The site as search and AI crawlers read it (--run to audit now)
+  suggest PRODUCT URL        Claude's suggestions for a page: title, description, sections
+
 Products and sources:
   products                   List products and their data sources
   products add NAME DOMAIN   Add a product
@@ -138,6 +147,12 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		err = a.alerts(ctx, rest)
 	case "notes", "note", "annotations":
 		err = a.notes(ctx, rest)
+	case "tasks", "task":
+		err = a.tasks(ctx, rest)
+	case "audit":
+		err = a.audit(ctx, rest)
+	case "suggest":
+		err = a.suggest(ctx, rest)
 	case "products", "product":
 		err = a.products(ctx, rest)
 	case "sources", "source":

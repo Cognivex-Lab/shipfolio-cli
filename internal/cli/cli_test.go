@@ -132,6 +132,25 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 				"period":{"start":"2026-10-24","end":"2026-11-20","prev_start":"2025-10-24","prev_end":"2025-11-20","days":28,"compare":"year"},
 				"gainers":[{"value":"alpha app","current":1200,"previous":1000,"delta":200,"change":0.2},{"value":"alpha new","current":30,"previous":0,"delta":30,"change":null}],
 				"losers":[{"value":"alpha old","current":5,"previous":50,"delta":-45,"change":-0.9}]}}`)
+		case "GET /v1/tasks":
+			io.WriteString(w, `{"status":"ok","data":[
+				{"id":"tsk_1","product_id":"prd_a","title":"OAI-SearchBot is blocked in robots.txt","detail":"ChatGPT cannot read the site.","fix":"User-agent: OAI-SearchBot\nAllow: /","source":"audit","level":"fail","url":"https://alpha.com/robots.txt","status":"open","created_at":"2026-11-23T00:00:00Z"},
+				{"id":"tsk_2","product_id":"prd_a","title":"Rewrite the pricing title","source":"opportunity","query":"alpha pricing","status":"done","done_on":"2026-10-01","created_at":"2026-09-30T00:00:00Z",
+				 "outcome":{"basis":"query","ready":true,"days_after":28,"before":{"clicks":100,"impressions":1000},"after":{"clicks":150,"impressions":1200},"clicks_change":0.5}}]}`)
+		case "PATCH /v1/tasks/tsk_1":
+			io.WriteString(w, `{"status":"ok","data":{"id":"tsk_1","product_id":"prd_a","title":"OAI-SearchBot is blocked in robots.txt","status":"done","done_on":"2026-11-25"}}`)
+		case "POST /v1/tasks":
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"status":"ok","data":{"id":"tsk_9","product_id":"prd_a","title":"x","status":"open"}}`)
+		case "GET /v1/site-audit", "POST /v1/products/prd_a/site-audit":
+			io.WriteString(w, `{"status":"ok","data":{"product_id":"prd_a","domain":"alpha.com","audit":{"checked_at":"2026-11-23T10:00:00Z","robots_status":200,"score":57,
+				"crawlers":[{"agent":"OAI-SearchBot","purpose":"search","allowed":false},{"agent":"Googlebot","purpose":"search","allowed":true}],
+				"checks":[{"id":"crawler_blocked","level":"fail","url":"https://alpha.com/robots.txt","title":"OAI-SearchBot is blocked in robots.txt"},{"id":"title_ok","level":"pass","title":"Title length is good"}]}}}`)
+		case "POST /v1/products/prd_a/page-suggestions":
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"status":"ok","data":{"id":"pgs_1","url":"https://alpha.com/pricing","lang":"en","suggestions":{"summary":"Lead with the price.",
+				"title":{"text":"Alpha pricing — free for 3 sites","why":"alpha pricing at position 4"},"description":{"text":"","why":""},"h1":{"text":"","why":""},
+				"sections":[{"heading":"What each plan includes","points":["Sites","API calls"],"why":"people compare plans"}],"faq":[{"question":"Is there a free plan?","answer":"Yes."}],"schema":[{"type":"Product","why":"prices"}]}}}`)
 		case "GET /v1/annotations":
 			io.WriteString(w, `{"status":"ok","data":[
 				{"id":"ann_1","product_id":"prd_a","date":"2026-11-02","text":"Launched v2","created_by":"api"},
@@ -848,5 +867,71 @@ func TestNewUsageErrors(t *testing.T) {
 		if r := app.exec(args...); r.code != 2 {
 			t.Errorf("%v: code %d, stderr %q", args, r.code, r.stderr)
 		}
+	}
+}
+
+func TestTasksAuditAndSuggest(t *testing.T) {
+	api := newFakeAPI(t)
+	app := keyed(t, api)
+
+	r := app.exec("tasks", "--product", "alpha.com")
+	if r.code != 0 || !strings.Contains(r.stdout, "tsk_1") || !strings.Contains(r.stdout, "OAI-SearchBot is blocked") || !strings.Contains(r.stdout, "tasks done ID") {
+		t.Fatalf("tasks: %+v", r)
+	}
+	if got := api.lastCall(); got != "GET /v1/tasks?product_id=prd_a&status=open" {
+		t.Fatalf("call = %q", got)
+	}
+	if r := app.exec("tasks", "--status", "later"); r.code != 2 {
+		t.Fatalf("bad status: %+v", r)
+	}
+	r = app.exec("tasks", "--fix")
+	if r.code != 0 || !strings.Contains(r.stdout, "How to fix it:\n  User-agent: OAI-SearchBot\n  Allow: /") {
+		t.Fatalf("tasks --fix: %q", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "done 2026-10-01 (clicks +50") {
+		t.Fatalf("done task's outcome missing: %q", r.stdout)
+	}
+	r = app.exec("tasks", "show", "tsk_2")
+	if r.code != 0 || !strings.Contains(r.stdout, "Outcome for the query: 100 clicks in the 28 days before, 150 in the 28 after") {
+		t.Fatalf("tasks show: %q", r.stdout)
+	}
+	if r := app.exec("tasks", "show", "tsk_404"); r.code != 1 {
+		t.Fatalf("unknown task: %+v", r)
+	}
+	r = app.exec("tasks", "done", "tsk_1")
+	if r.code != 0 || !strings.Contains(r.stdout, "Done: OAI-SearchBot is blocked") {
+		t.Fatalf("tasks done: %+v", r)
+	}
+	if got := api.body("PATCH /v1/tasks/tsk_1"); got != `{"status":"done"}` {
+		t.Fatalf("body = %s", got)
+	}
+	r = app.exec("tasks", "add", "alpha.com", "Add", "an", "FAQ", "--url", "https://alpha.com/pricing")
+	if r.code != 0 || !strings.Contains(r.stdout, "Added task tsk_9") {
+		t.Fatalf("tasks add: %+v", r)
+	}
+	if got := api.body("POST /v1/tasks"); got != `{"product_id":"prd_a","source":"manual","title":"Add an FAQ","url":"https://alpha.com/pricing"}` {
+		t.Fatalf("body = %s", got)
+	}
+
+	r = app.exec("audit", "alpha.com")
+	if r.code != 0 || !strings.Contains(r.stdout, "score 57/100") || !strings.Contains(r.stdout, "Blocked in robots.txt: OAI-SearchBot (search)") || strings.Contains(r.stdout, "Title length is good") {
+		t.Fatalf("audit: %q", r.stdout)
+	}
+	if r := app.exec("audit", "alpha.com", "--run", "--all"); r.code != 0 || !strings.Contains(r.stdout, "Title length is good") {
+		t.Fatalf("audit --run --all: %+v", r)
+	}
+	if got := api.lastCall(); got != "POST /v1/products/prd_a/site-audit" {
+		t.Fatalf("call = %q", got)
+	}
+
+	r = app.exec("suggest", "alpha.com", "https://alpha.com/pricing")
+	if r.code != 0 || !strings.Contains(r.stdout, "Title: Alpha pricing — free for 3 sites") || !strings.Contains(r.stdout, "Add: What each plan includes") || strings.Contains(r.stdout, "Description:") {
+		t.Fatalf("suggest: %q", r.stdout)
+	}
+	if got := api.body("POST /v1/products/prd_a/page-suggestions"); got != `{"lang":"en","url":"https://alpha.com/pricing"}` {
+		t.Fatalf("body = %s", got)
+	}
+	if r := app.exec("suggest", "alpha.com", "https://alpha.com/x", "--lang", "fr"); r.code != 2 {
+		t.Fatalf("bad lang: %+v", r)
 	}
 }

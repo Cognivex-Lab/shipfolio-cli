@@ -384,3 +384,100 @@ type ImportedProduct struct {
 type ImportResult struct {
 	Created []ImportedProduct `json:"created"`
 }
+
+// TaskFigures are Search Console sums over 28 days.
+type TaskFigures struct {
+	Clicks      float64  `json:"clicks"`
+	Impressions float64  `json:"impressions"`
+	CTR         *float64 `json:"ctr"`
+	Position    *float64 `json:"avg_position"`
+}
+
+// Task is something to change on a product's site, with how.
+type Task struct {
+	ID        string            `json:"id"`
+	ProductID string            `json:"product_id"`
+	Title     string            `json:"title"`
+	Detail    string            `json:"detail"`
+	Fix       string            `json:"fix"`
+	Source    string            `json:"source"`
+	RuleID    string            `json:"rule_id"`
+	Params    map[string]string `json:"params"`
+	Level     string            `json:"level"`
+	URL       string            `json:"url"`
+	Query     string            `json:"query"`
+	Status    string            `json:"status"`
+	DoneOn    string            `json:"done_on"`
+	DoneBy    string            `json:"done_by"`
+	CreatedAt string            `json:"created_at"`
+	Outcome   *struct {
+		Basis        string       `json:"basis"`
+		Ready        bool         `json:"ready"`
+		DaysAfter    int          `json:"days_after"`
+		Before       *TaskFigures `json:"before"`
+		After        *TaskFigures `json:"after"`
+		ClicksChange *float64     `json:"clicks_change"`
+	} `json:"outcome"`
+}
+
+// AuditCheck is one finding of a site audit.
+type AuditCheck struct {
+	ID     string `json:"id"`
+	Level  string `json:"level"`
+	URL    string `json:"url"`
+	Title  string `json:"title"`
+	Detail string `json:"detail"`
+	Fix    string `json:"fix"`
+}
+
+// SiteAudit is a product's latest site audit; Audit is nil before the first.
+type SiteAudit struct {
+	ProductID string `json:"product_id"`
+	Domain    string `json:"domain"`
+	Audit     *struct {
+		CheckedAt string   `json:"checked_at"`
+		Robots    int      `json:"robots_status"`
+		Sitemaps  []string `json:"sitemaps"`
+		LLMsTxt   bool     `json:"llms_txt"`
+		Score     int      `json:"score"`
+		Crawlers  []struct {
+			Agent   string `json:"agent"`
+			Owner   string `json:"owner"`
+			Purpose string `json:"purpose"`
+			Allowed bool   `json:"allowed"`
+		} `json:"crawlers"`
+		Checks []AuditCheck `json:"checks"`
+	} `json:"audit"`
+}
+
+// Rewrite is a suggested text; Text is empty when the current one is fine.
+type Rewrite struct {
+	Text string `json:"text"`
+	Why  string `json:"why"`
+}
+
+// PageSuggestions are Claude's suggestions for one page.
+type PageSuggestions struct {
+	ID          string `json:"id"`
+	URL         string `json:"url"`
+	Lang        string `json:"lang"`
+	Suggestions struct {
+		Summary     string  `json:"summary"`
+		Title       Rewrite `json:"title"`
+		Description Rewrite `json:"description"`
+		H1          Rewrite `json:"h1"`
+		Sections    []struct {
+			Heading string   `json:"heading"`
+			Points  []string `json:"points"`
+			Why     string   `json:"why"`
+		} `json:"sections"`
+		FAQ []struct {
+			Question string `json:"question"`
+			Answer   string `json:"answer"`
+		} `json:"faq"`
+		Schema []struct {
+			Type string `json:"type"`
+			Why  string `json:"why"`
+		} `json:"schema"`
+	} `json:"suggestions"`
+}
