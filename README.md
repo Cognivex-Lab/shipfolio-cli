@@ -58,6 +58,13 @@ shipfolio notes [--product PRODUCT] [--start 2026-11-01 --end 2026-11-30]
 shipfolio note add [--product PRODUCT] DATE|today TEXT
 shipfolio note rm ID [--yes]
 
+shipfolio tasks [--product PRODUCT] [--status open|done|dismissed|all] [--fix]
+shipfolio tasks show ID
+shipfolio tasks done|dismiss|reopen ID...
+shipfolio tasks add PRODUCT TITLE [--url URL] [--query QUERY] [--fix TEXT]
+shipfolio audit PRODUCT [--run] [--all]
+shipfolio suggest PRODUCT URL [--lang en|es|zh-CN]
+
 shipfolio products                      # list, with data sources
 shipfolio products add NAME DOMAIN [--tags a,b]
 shipfolio products rename PRODUCT [--name NAME] [--domain DOMAIN] [--tags a,b]
