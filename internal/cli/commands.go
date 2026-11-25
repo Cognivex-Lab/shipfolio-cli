@@ -6,11 +6,13 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Cognivex-Lab/shipfolio-cli/internal/client"
 )
@@ -32,13 +34,24 @@ func (a *App) fetch(ctx context.Context, cl *client.Client, c *common, method, p
 }
 
 func (a *App) login(ctx context.Context, args []string) error {
-	fs, c := newFlags("login", "login [--api-url URL] < key.txt", a.Stderr)
+	fs, c := newFlags("login", "login [--api-url URL] < key.txt\n       shipfolio login --browser [--api-url URL]", a.Stderr)
+	browser := fs.Bool("browser", false, "sign in through the browser instead of pasting a key (read-only)")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) > 0 {
 		return usagef("login reads the key from a prompt or stdin, not from arguments, so it stays out of your shell history")
+	}
+	if *browser {
+		cfg, err := a.loadConfig()
+		if err != nil {
+			return err
+		}
+		if c.apiURL != "" {
+			cfg.APIURL = strings.TrimRight(c.apiURL, "/")
+		}
+		return a.loginBrowser(ctx, c, cfg)
 	}
 	var key string
 	if a.Interactive() {
@@ -66,6 +79,10 @@ func (a *App) login(ctx context.Context, args []string) error {
 	if err := a.newClient(c, key, cfg).Call(ctx, "GET", "/v1/whoami", nil, nil, &who); err != nil {
 		return err
 	}
+	if cfg.OAuth != nil {
+		a.revokeSaved(ctx, cfg.OAuth)
+		cfg.OAuth = nil
+	}
 	cfg.APIKey = key
 	if err := a.saveConfig(cfg); err != nil {
 		return err
@@ -77,7 +94,7 @@ func (a *App) login(ctx context.Context, args []string) error {
 	return nil
 }
 
-func (a *App) logout(args []string) error {
+func (a *App) logout(ctx context.Context, args []string) error {
 	fs, _ := newFlags("logout", "logout", a.Stderr)
 	if _, err := parse(fs, args); err != nil {
 		return err
@@ -86,15 +103,25 @@ func (a *App) logout(args []string) error {
 	if err != nil {
 		return err
 	}
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && cfg.OAuth == nil {
 		fmt.Fprintln(a.Stdout, "No key was saved.")
 		return nil
 	}
-	cfg.APIKey = ""
+	login, hadKey := cfg.OAuth, cfg.APIKey != ""
+	cfg.APIKey, cfg.OAuth = "", nil
 	if err := a.saveConfig(cfg); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.Stdout, "Removed the saved key. It still works until you revoke it in the dashboard.")
+	if hadKey {
+		fmt.Fprintln(a.Stdout, "Removed the saved key. It still works until you revoke it in the dashboard.")
+	}
+	if login != nil {
+		if a.revokeSaved(ctx, login) {
+			fmt.Fprintln(a.Stdout, "Signed out and ended the browser sign-in.")
+		} else {
+			fmt.Fprintln(a.Stdout, "Removed the saved browser sign-in, but could not end it on the server. Disconnect it in the dashboard under Account, Connected apps.")
+		}
+	}
 	return nil
 }
 
@@ -117,11 +144,17 @@ func (a *App) whoami(ctx context.Context, args []string) error {
 	row(tw, "ID", w.WorkspaceID)
 	row(tw, "Plan", w.Plan)
 	row(tw, "Scopes", strings.Join(w.Scopes, ", "))
+	if a.oauth {
+		row(tw, "Signed in", "through the browser (read-only)")
+	} else {
+		row(tw, "Signed in", "with an API key")
+	}
 	row(tw, "API", cl.BaseURL)
 	return tw.Flush()
 }
 
-// periodValue accepts 7d, 28d and 90d as well as the API's own names.
+// periodValue accepts 7d, 28d, 90d and 365d (or 1y) as well as the API's
+// own names.
 func periodValue(s string) (string, error) {
 	switch strings.ToLower(s) {
 	case "":
@@ -132,8 +165,24 @@ func periodValue(s string) (string, error) {
 		return "last_28_days", nil
 	case "90", "90d", "last_90_days":
 		return "last_90_days", nil
+	case "365", "365d", "1y", "12m", "last_365_days":
+		return "last_365_days", nil
 	}
-	return "", usagef("--period must be 7d, 28d or 90d")
+	return "", usagef("--period must be 7d, 28d, 90d or 365d")
+}
+
+// compareValue checks --compare: previous (the days just before) or year
+// (the same days a year earlier).
+func compareValue(s string) (string, error) {
+	switch strings.ToLower(s) {
+	case "":
+		return "", nil
+	case "previous", "prev":
+		return "previous", nil
+	case "year", "yoy", "last_year":
+		return "year", nil
+	}
+	return "", usagef("--compare must be previous or year")
 }
 
 // rangeQuery adds --period or --start/--end to a query.
@@ -160,14 +209,22 @@ func rangeQuery(q url.Values, period, start, end string) error {
 }
 
 func (a *App) overview(ctx context.Context, args []string) error {
-	fs, c := newFlags("overview", "overview [--period 7d|28d|90d]", a.Stderr)
-	period := fs.String("period", "", "7d, 28d (default) or 90d")
+	fs, c := newFlags("overview", "overview [--period 7d|28d|90d|365d] [--compare previous|year]", a.Stderr)
+	period := fs.String("period", "", "7d, 28d (default), 90d or 365d")
+	compare := fs.String("compare", "", "previous (default: the days just before) or year (the same days a year earlier)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
 	q := url.Values{}
 	if err := rangeQuery(q, *period, "", ""); err != nil {
 		return err
+	}
+	cmp, err := compareValue(*compare)
+	if err != nil {
+		return err
+	}
+	if cmp != "" {
+		q.Set("compare", cmp)
 	}
 	cl, err := a.client(c)
 	if err != nil {
@@ -183,14 +240,14 @@ func (a *App) overview(ctx context.Context, args []string) error {
 		return nil
 	}
 	if o.Period.Start != "" {
-		fmt.Fprintf(a.Stdout, "%s to %s (%d days), against %s to %s\n", o.Period.Start, o.Period.End, o.Period.Days, o.Period.PrevStart, o.Period.PrevEnd)
+		fmt.Fprintf(a.Stdout, "%s to %s (%d days), against %s\n", o.Period.Start, o.Period.End, o.Period.Days, againstText(o.Period))
 	}
 	if !o.HasData {
 		fmt.Fprintln(a.Stdout, "No data yet. Connect Search Console or GA4 to a product in the dashboard.")
 	}
 	fmt.Fprintln(a.Stdout)
 	tw := newTable(a.Stdout)
-	row(tw, "PRODUCT", "CLICKS", "CHANGE", "IMPRESSIONS", "CHANGE", "CTR", "POSITION", "SESSIONS", "CHANGE", "KEY EVENTS")
+	row(tw, "PRODUCT", "CLICKS", "CHANGE", "IMPRESSIONS", "CHANGE", "CTR", "POSITION", "SESSIONS", "CHANGE", "KEY EVENTS", "BING CLICKS", "CHANGE")
 	for _, p := range o.Products {
 		cur := p.Current
 		row(tw, productLabel(p.Name, p.Domain),
@@ -198,7 +255,8 @@ func (a *App) overview(ctx context.Context, args []string) error {
 			fmtMetric("impressions", cur.Impressions), fmtChange(p.Change["impressions"]),
 			fmtMetric("ctr", cur.CTR), fmtMetric("avg_position", cur.AvgPosition),
 			fmtMetric("sessions", cur.Sessions), fmtChange(p.Change["sessions"]),
-			fmtMetric("key_events", cur.KeyEvents))
+			fmtMetric("key_events", cur.KeyEvents),
+			fmtMetric("bing_clicks", cur.BingClicks), fmtChange(p.Change["bing_clicks"]))
 	}
 	if err := tw.Flush(); err != nil {
 		return err
@@ -213,7 +271,7 @@ func (a *App) metrics(ctx context.Context, args []string) error {
 	fs, c := newFlags("metrics", "metrics PRODUCT... [--metrics clicks,sessions] [--granularity day|week|month] [--period 28d | --start DATE --end DATE] [--csv]", a.Stderr)
 	metrics := fs.String("metrics", "clicks,impressions,sessions", "comma-separated metric names")
 	gran := fs.String("granularity", "day", "day, week or month")
-	period := fs.String("period", "", "7d, 28d (default) or 90d")
+	period := fs.String("period", "", "7d, 28d (default), 90d or 365d")
 	start := fs.String("start", "", "first day, YYYY-MM-DD")
 	end := fs.String("end", "", "last day, YYYY-MM-DD, inclusive")
 	asCSV := fs.Bool("csv", false, "print CSV")
@@ -307,10 +365,10 @@ func (a *App) metrics(ctx context.Context, args []string) error {
 }
 
 func (a *App) breakdown(ctx context.Context, args []string) error {
-	fs, c := newFlags("breakdown", "breakdown PRODUCT query|page|country|device|channel|landing_page [--metric clicks] [--limit 25] [--period 28d | --start DATE --end DATE] [--csv]", a.Stderr)
-	metric := fs.String("metric", "", "sort by this metric (default clicks, or sessions for GA4 dimensions)")
+	fs, c := newFlags("breakdown", "breakdown PRODUCT query|page|country|device|channel|landing_page|bing_query|bing_page [--metric clicks] [--limit 25] [--period 28d | --start DATE --end DATE] [--csv]", a.Stderr)
+	metric := fs.String("metric", "", "sort by this metric (default clicks, sessions for GA4 dimensions, bing_clicks for Bing)")
 	limit := fs.Int("limit", 25, "rows to return, 1 to 1000")
-	period := fs.String("period", "", "7d, 28d (default) or 90d")
+	period := fs.String("period", "", "7d, 28d (default), 90d or 365d")
 	start := fs.String("start", "", "first day, YYYY-MM-DD")
 	end := fs.String("end", "", "last day, YYYY-MM-DD, inclusive")
 	asCSV := fs.Bool("csv", false, "print CSV")
@@ -319,7 +377,7 @@ func (a *App) breakdown(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(pos) != 2 {
-		return usagef("breakdown needs a product and a dimension (query, page, country, device, channel or landing_page)")
+		return usagef("breakdown needs a product and a dimension (query, page, country, device, channel, landing_page, bing_query or bing_page)")
 	}
 	if *limit < 1 || *limit > 1000 {
 		return usagef("--limit must be between 1 and 1000")
@@ -469,10 +527,14 @@ func (a *App) products(ctx context.Context, args []string) error {
 		return a.productsList(ctx, args)
 	case "add":
 		return a.productsAdd(ctx, args)
+	case "rename", "edit", "update":
+		return a.productsRename(ctx, args)
+	case "import":
+		return a.productsImport(ctx, args)
 	case "rm", "delete", "remove":
 		return a.productsRemove(ctx, args)
 	}
-	return usagef("unknown products command %q (list, add or rm)", sub)
+	return usagef("unknown products command %q (list, add, rename, import or rm)", sub)
 }
 
 func (a *App) productsList(ctx context.Context, args []string) error {
@@ -841,6 +903,13 @@ func (a *App) mcp(args []string) error {
 	fmt.Fprintf(a.Stdout, `AI agents read the same data over MCP (Streamable HTTP).
 
 Endpoint:  %s
+
+Clients that support MCP authorization (OAuth), such as Claude, Cursor and
+VS Code, need only that URL: they open a browser where you sign in and
+approve read-only access to your workspace.
+
+Other clients send an API key:
+
 Header:    Authorization: Bearer YOUR_API_KEY
 
 For clients configured with an "mcpServers" file:
@@ -947,4 +1016,461 @@ func (a *App) confirm(yes bool, question string) error {
 		return nil
 	}
 	return errCancelled
+}
+
+func (a *App) productsRename(ctx context.Context, args []string) error {
+	fs, c := newFlags("products rename", "products rename PRODUCT [--name NAME] [--domain DOMAIN] [--tags a,b]", a.Stderr)
+	name := fs.String("name", "", "new name")
+	domain := fs.String("domain", "", "new bare domain, e.g. example.com")
+	tags := fs.String("tags", "", "comma-separated tags, replacing the current ones (\"\" clears them)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usagef("products rename needs one product, e.g. products rename acme.com --name Acme")
+	}
+	body := map[string]any{}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "name":
+			body["name"] = *name
+		case "domain":
+			body["domain"] = *domain
+		case "tags":
+			t := splitList(*tags)
+			if t == nil {
+				t = []string{}
+			}
+			body["tags"] = t
+		}
+	})
+	if len(body) == 0 {
+		return usagef("products rename needs --name, --domain or --tags")
+	}
+	cl, err := a.client(c)
+	if err != nil {
+		return err
+	}
+	ps, err := a.resolve(ctx, cl, pos)
+	if err != nil {
+		return err
+	}
+	var resp client.Envelope[client.Product]
+	if printed, err := a.fetch(ctx, cl, c, "PATCH", "/v1/products/"+url.PathEscape(ps[0].ID), nil, body, &resp); printed || err != nil {
+		return err
+	}
+	p := resp.Data
+	tagText := "no tags"
+	if len(p.Tags) > 0 {
+		tagText = "tags " + strings.Join(p.Tags, ", ")
+	}
+	fmt.Fprintf(a.Stdout, "Updated %s: %s, %s, %s.\n", p.ID, p.Name, p.Domain, tagText)
+	return nil
+}
+
+func (a *App) productsImport(ctx context.Context, args []string) error {
+	fs, c := newFlags("products import", "products import --gsc CONN [--ga4 CONN] [--all | SITE...] [--yes]", a.Stderr)
+	gsc := fs.String("gsc", "", "Search Console connection id (see 'shipfolio google connections')")
+	ga4 := fs.String("ga4", "", "GA4 connection id, to match each site with a property on the same domain")
+	all := fs.Bool("all", false, "import every site that has no product yet")
+	yes := fs.Bool("yes", false, "create the products without asking")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if *gsc == "" {
+		return usagef("products import needs --gsc with a Search Console connection id (see 'shipfolio google connections')")
+	}
+	if *all && len(pos) > 0 {
+		return usagef("give either --all or the sites to import, not both")
+	}
+	cl, err := a.client(c)
+	if err != nil {
+		return err
+	}
+	q := url.Values{"gsc": {*gsc}}
+	if *ga4 != "" {
+		q.Set("ga4", *ga4)
+	}
+	var preview client.Envelope[client.ImportPreview]
+	if !*all && len(pos) == 0 {
+		// Only show what an import would do.
+		if printed, err := a.fetch(ctx, cl, c, "GET", "/v1/products/import", q, nil, &preview); printed || err != nil {
+			return err
+		}
+		return a.printImportPreview(preview.Data, *ga4 != "")
+	}
+	if err := cl.Call(ctx, "GET", "/v1/products/import", q, nil, &preview); err != nil {
+		return err
+	}
+	var chosen []client.ImportSite
+	if *all {
+		for _, s := range preview.Data.Sites {
+			if !s.Exists {
+				chosen = append(chosen, s)
+			}
+		}
+	} else {
+		for _, ref := range pos {
+			s, err := matchSite(preview.Data.Sites, ref)
+			if err != nil {
+				return err
+			}
+			if s.Exists {
+				fmt.Fprintf(a.Stderr, "%s already has a product; skipping it.\n", s.Domain)
+				continue
+			}
+			chosen = append(chosen, s)
+		}
+	}
+	if len(chosen) == 0 {
+		fmt.Fprintln(a.Stdout, "Nothing to import: every site already has a product.")
+		return nil
+	}
+	domains := make([]string, len(chosen))
+	sites := make([]string, len(chosen))
+	for i, s := range chosen {
+		domains[i], sites[i] = s.Domain, s.ExternalID
+	}
+	if err := a.confirm(*yes, fmt.Sprintf("Create %d product(s) (%s) and start importing their history?", len(chosen), strings.Join(domains, ", "))); err != nil {
+		return err
+	}
+	body := map[string]any{"gsc": *gsc, "sites": sites}
+	if *ga4 != "" {
+		body["ga4"] = *ga4
+	}
+	var resp client.Envelope[client.ImportResult]
+	if printed, err := a.fetch(ctx, cl, c, "POST", "/v1/products/import", nil, body, &resp); printed || err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "Created %d product(s). Their history is importing now; 'shipfolio products' shows how far it got.\n\n", len(resp.Data.Created))
+	tw := newTable(a.Stdout)
+	row(tw, "ID", "NAME", "DOMAIN", "GA4")
+	for _, p := range resp.Data.Created {
+		g := "no"
+		if p.GA4 {
+			g = "yes"
+		}
+		row(tw, p.ID, p.Name, p.Domain, g)
+	}
+	return tw.Flush()
+}
+
+func (a *App) printImportPreview(p client.ImportPreview, withGA4 bool) error {
+	if len(p.Sites) == 0 {
+		fmt.Fprintln(a.Stdout, "This Google account cannot read any Search Console sites.")
+		return nil
+	}
+	tw := newTable(a.Stdout)
+	head := []string{"SITE", "DOMAIN", "NAME", "STATUS"}
+	if withGA4 {
+		head = append(head, "GA4 PROPERTY")
+	}
+	row(tw, head...)
+	fresh := 0
+	for _, s := range p.Sites {
+		status := "new"
+		if s.Exists {
+			status = "has a product"
+		} else {
+			fresh++
+		}
+		cells := []string{s.ExternalID, s.Domain, s.Name, status}
+		if withGA4 {
+			g := "no match"
+			if s.GA4 != nil {
+				g = s.GA4["external_id"]
+				if l := s.GA4["label"]; l != "" {
+					g = l + " (" + g + ")"
+				}
+			}
+			cells = append(cells, g)
+		}
+		row(tw, cells...)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if p.Plan != "" {
+		fmt.Fprintf(a.Stdout, "\nThe %s plan holds %d products; the workspace has %d.\n", p.Plan, p.Limit, p.Products)
+	}
+	if fresh > 0 {
+		fmt.Fprintln(a.Stdout, "Nothing was created. Pass --all to import every new site, or name the sites or domains to import.")
+	}
+	return nil
+}
+
+// matchSite finds a site by its Search Console id or its domain.
+func matchSite(sites []client.ImportSite, ref string) (client.ImportSite, error) {
+	for _, s := range sites {
+		if s.ExternalID == ref {
+			return s, nil
+		}
+	}
+	d := bareDomain(strings.TrimPrefix(ref, "sc-domain:"))
+	for _, s := range sites {
+		if s.Domain == d {
+			return s, nil
+		}
+	}
+	return client.ImportSite{}, fmt.Errorf("this Google account has no Search Console site %q; run without sites to list them", ref)
+}
+
+func (a *App) movers(ctx context.Context, args []string) error {
+	fs, c := newFlags("movers", "movers PRODUCT query|page|country|device|channel|landing_page|bing_query|bing_page [--metric clicks] [--period 28d] [--compare year] [--limit 10] [--csv]", a.Stderr)
+	metric := fs.String("metric", "", "a count to rank by: clicks, impressions, sessions, users, key_events, bing_clicks or bing_impressions (default fits the dimension)")
+	period := fs.String("period", "", "7d, 28d (default), 90d or 365d")
+	compare := fs.String("compare", "", "previous (default: the days just before) or year (the same days a year earlier)")
+	limit := fs.Int("limit", 10, "gainers and losers to show, 1 to 50")
+	asCSV := fs.Bool("csv", false, "print CSV")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 {
+		return usagef("movers needs a product and a dimension (query, page, country, device, channel, landing_page, bing_query or bing_page)")
+	}
+	if *limit < 1 || *limit > 50 {
+		return usagef("--limit must be between 1 and 50")
+	}
+	q := url.Values{"dimension": {pos[1]}, "limit": {strconv.Itoa(*limit)}}
+	if *metric != "" {
+		q.Set("metric", *metric)
+	}
+	if err := rangeQuery(q, *period, "", ""); err != nil {
+		return err
+	}
+	cmp, err := compareValue(*compare)
+	if err != nil {
+		return err
+	}
+	if cmp != "" {
+		q.Set("compare", cmp)
+	}
+	cl, err := a.client(c)
+	if err != nil {
+		return err
+	}
+	products, err := a.resolve(ctx, cl, pos[:1])
+	if err != nil {
+		return err
+	}
+	q.Set("product_id", products[0].ID)
+	var resp client.Envelope[client.Movers]
+	if printed, err := a.fetch(ctx, cl, c, "GET", "/v1/metrics/movers", q, nil, &resp); printed || err != nil {
+		return err
+	}
+	m := resp.Data
+	if *asCSV {
+		w := csv.NewWriter(a.Stdout)
+		_ = w.Write([]string{"direction", m.Dimension, "previous", "current", "delta", "change"})
+		for _, part := range []struct {
+			name string
+			rows []client.Mover
+		}{{"gainer", m.Gainers}, {"loser", m.Losers}} {
+			for _, r := range part.rows {
+				prev, cur, delta := r.Previous, r.Current, r.Delta
+				_ = w.Write([]string{part.name, r.Value, csvValue(&prev), csvValue(&cur), csvValue(&delta), csvValue(r.Change)})
+			}
+		}
+		w.Flush()
+		return w.Error()
+	}
+	p := products[0]
+	dim := strings.ReplaceAll(m.Dimension, "_", " ")
+	fmt.Fprintf(a.Stdout, "%s, %s by %s, %s to %s against %s\n", productLabel(p.Name, p.Domain), dim, strings.ReplaceAll(m.Metric, "_", " "), m.Period.Start, m.Period.End, againstText(m.Period))
+	for _, part := range []struct {
+		title string
+		rows  []client.Mover
+	}{{"Gainers", m.Gainers}, {"Losers", m.Losers}} {
+		fmt.Fprintf(a.Stdout, "\n%s\n", part.title)
+		if len(part.rows) == 0 {
+			fmt.Fprintln(a.Stdout, "None.")
+			continue
+		}
+		tw := newTable(a.Stdout)
+		row(tw, strings.ToUpper(dim), "PREVIOUS", "CURRENT", "DELTA", "CHANGE")
+		for _, r := range part.rows {
+			prev, cur := r.Previous, r.Current
+			row(tw, r.Value, fmtMetric(m.Metric, &prev), fmtMetric(m.Metric, &cur), fmtDelta(r.Delta), fmtChange(r.Change))
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) notes(ctx context.Context, args []string) error {
+	sub := "list"
+	if len(args) > 0 {
+		switch args[0] {
+		case "list", "ls", "add", "rm", "delete", "remove":
+			sub, args = args[0], args[1:]
+		}
+	}
+	switch sub {
+	case "add":
+		return a.noteAdd(ctx, args)
+	case "rm", "delete", "remove":
+		return a.noteRemove(ctx, args)
+	}
+	return a.notesList(ctx, args)
+}
+
+func (a *App) notesList(ctx context.Context, args []string) error {
+	fs, c := newFlags("notes", "notes [--product PRODUCT] [--start DATE --end DATE]", a.Stderr)
+	product := fs.String("product", "", "only notes on this product (and those on every product)")
+	start := fs.String("start", "", "first day, YYYY-MM-DD")
+	end := fs.String("end", "", "last day, YYYY-MM-DD, inclusive")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return usagef("unknown notes command %q (list, add or rm)", pos[0])
+	}
+	q := url.Values{}
+	for name, v := range map[string]string{"start": *start, "end": *end} {
+		if v == "" {
+			continue
+		}
+		if !validDate(v) {
+			return usagef("--%s must be YYYY-MM-DD", name)
+		}
+		q.Set(name, v)
+	}
+	cl, err := a.client(c)
+	if err != nil {
+		return err
+	}
+	all, err := a.listProducts(ctx, cl)
+	if err != nil {
+		return err
+	}
+	if *product != "" {
+		p, err := match(all, *product)
+		if err != nil {
+			return err
+		}
+		q.Set("product_id", p.ID)
+	}
+	var resp client.Envelope[[]client.Annotation]
+	if printed, err := a.fetch(ctx, cl, c, "GET", "/v1/annotations", q, nil, &resp); printed || err != nil {
+		return err
+	}
+	if len(resp.Data) == 0 {
+		fmt.Fprintln(a.Stdout, "No notes. Add one with 'shipfolio note add today \"Launched v2\"'.")
+		return nil
+	}
+	names := map[string]string{}
+	for _, p := range all {
+		names[p.ID] = productLabel(p.Name, p.Domain)
+	}
+	tw := newTable(a.Stdout)
+	row(tw, "ID", "DATE", "PRODUCT", "NOTE", "BY")
+	for _, n := range resp.Data {
+		name := "all products"
+		if n.ProductID != "" {
+			if name = names[n.ProductID]; name == "" {
+				name = n.ProductID
+			}
+		}
+		row(tw, n.ID, n.Date, name, n.Text, n.CreatedBy)
+	}
+	return tw.Flush()
+}
+
+func (a *App) noteAdd(ctx context.Context, args []string) error {
+	fs, c := newFlags("note add", "note add [--product PRODUCT] DATE|today TEXT", a.Stderr)
+	product := fs.String("product", "", "the product the note is about (default: every product)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 2 {
+		return usagef("note add needs a date and the text, e.g. note add today \"Launched v2\"")
+	}
+	date, err := a.dateValue(pos[0])
+	if err != nil {
+		return err
+	}
+	text := strings.TrimSpace(strings.Join(pos[1:], " "))
+	if text == "" || len([]rune(text)) > 280 {
+		return usagef("the note must be 1 to 280 characters")
+	}
+	cl, err := a.client(c)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"date": date, "text": text}
+	label := "every product"
+	if *product != "" {
+		ps, err := a.resolve(ctx, cl, []string{*product})
+		if err != nil {
+			return err
+		}
+		body["product_id"] = ps[0].ID
+		label = productLabel(ps[0].Name, ps[0].Domain)
+	}
+	var resp client.Envelope[client.Annotation]
+	if printed, err := a.fetch(ctx, cl, c, "POST", "/v1/annotations", nil, body, &resp); printed || err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "Added note %s on %s for %s.\n", resp.Data.ID, resp.Data.Date, label)
+	return nil
+}
+
+func (a *App) noteRemove(ctx context.Context, args []string) error {
+	fs, c := newFlags("note rm", "note rm ID [--yes]", a.Stderr)
+	yes := fs.Bool("yes", false, "delete without asking")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usagef("note rm needs one note id (see 'shipfolio notes')")
+	}
+	cl, err := a.client(c)
+	if err != nil {
+		return err
+	}
+	question := fmt.Sprintf("Delete note %s?", pos[0])
+	var list client.Envelope[[]client.Annotation]
+	if err := cl.Call(ctx, "GET", "/v1/annotations", nil, nil, &list); err == nil {
+		for _, n := range list.Data {
+			if n.ID == pos[0] {
+				question = fmt.Sprintf("Delete the note of %s, %q?", n.Date, n.Text)
+			}
+		}
+	}
+	if err := a.confirm(*yes, question); err != nil {
+		return err
+	}
+	var resp client.Envelope[map[string]any]
+	if printed, err := a.fetch(ctx, cl, c, "DELETE", "/v1/annotations/"+url.PathEscape(pos[0]), nil, nil, &resp); printed || err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "Deleted note %s.\n", pos[0])
+	return nil
+}
+
+// dateValue reads YYYY-MM-DD, today or yesterday (on this computer's clock).
+func (a *App) dateValue(s string) (string, error) {
+	switch strings.ToLower(s) {
+	case "today":
+		return a.now().Format(time.DateOnly), nil
+	case "yesterday":
+		return a.now().AddDate(0, 0, -1).Format(time.DateOnly), nil
+	}
+	if !validDate(s) {
+		return "", usagef("the date must be YYYY-MM-DD, today or yesterday, not %q", s)
+	}
+	return s, nil
+}
+
+func validDate(s string) bool {
+	_, err := time.Parse(time.DateOnly, s)
+	return err == nil
 }

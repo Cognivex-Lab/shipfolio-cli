@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Cognivex-Lab/shipfolio-cli/internal/client"
 )
@@ -34,6 +36,22 @@ type App struct {
 	Interactive func() bool
 	// ReadSecret prompts for a value without echoing it.
 	ReadSecret func(prompt string) (string, error)
+	// OpenBrowser opens a URL in the person's browser. It may be nil; the
+	// URL is printed as well.
+	OpenBrowser func(url string) error
+	// Now is the clock; nil means time.Now.
+	Now func() time.Time
+
+	// oauth is set once a command authenticates with a browser sign-in,
+	// so errors can suggest what fits that kind of login.
+	oauth bool
+}
+
+func (a *App) now() time.Time {
+	if a.Now != nil {
+		return a.Now()
+	}
+	return time.Now()
 }
 
 const usageText = `shipfolio reads your Shipfolio workspace from the terminal.
@@ -43,18 +61,26 @@ Usage:
 
 Account:
   login                      Save an API key (read from stdin or a prompt)
-  logout                     Forget the saved key
+  login --browser            Sign in through the browser instead (read-only)
+  logout                     Forget the saved key or sign-in
   whoami                     Show the workspace and scopes of the key
 
 Data:
   overview                   Every product's totals against the period before
   metrics PRODUCT...         Daily, weekly or monthly series
-  breakdown PRODUCT DIM      Top queries, pages, countries, devices, channels or landing pages
+  breakdown PRODUCT DIM      Top queries, pages, countries, devices, channels,
+                             landing pages, Bing queries or Bing pages
+  movers PRODUCT DIM         What gained and lost the most against the period before
   alerts                     Traffic-drop alerts, newest first
+  notes                      Annotations on the charts
+  note add DATE TEXT         Annotate a day (DATE may be today)
+  note rm ID                 Delete an annotation
 
 Products and sources:
   products                   List products and their data sources
   products add NAME DOMAIN   Add a product
+  products rename PRODUCT    Change a product's name, domain or tags
+  products import --gsc CONN Create products from a Google account's Search Console sites
   products rm PRODUCT        Delete a product with its history
   sources list PRODUCT       List a product's data sources
   sources add PRODUCT        Connect a Search Console site or GA4 property
@@ -97,7 +123,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "login":
 		err = a.login(ctx, rest)
 	case "logout":
-		err = a.logout(rest)
+		err = a.logout(ctx, rest)
 	case "whoami":
 		err = a.whoami(ctx, rest)
 	case "overview":
@@ -106,8 +132,12 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		err = a.metrics(ctx, rest)
 	case "breakdown":
 		err = a.breakdown(ctx, rest)
+	case "movers":
+		err = a.movers(ctx, rest)
 	case "alerts":
 		err = a.alerts(ctx, rest)
+	case "notes", "note", "annotations":
+		err = a.notes(ctx, rest)
 	case "products", "product":
 		err = a.products(ctx, rest)
 	case "sources", "source":
@@ -155,9 +185,17 @@ func (a *App) report(err error) int {
 	if errors.As(err, &ae) {
 		switch ae.Code {
 		case "unauthorized":
-			fmt.Fprintln(a.Stderr, "Check the key, or run 'shipfolio login' with a new one.")
+			if a.oauth {
+				fmt.Fprintln(a.Stderr, "Sign in again with 'shipfolio login --browser'.")
+			} else {
+				fmt.Fprintln(a.Stderr, "Check the key, or run 'shipfolio login' with a new one.")
+			}
 		case "insufficient_scope":
-			fmt.Fprintln(a.Stderr, "This key lacks the scope for that. An admin can create a key with more scopes in the dashboard.")
+			if a.oauth {
+				fmt.Fprintln(a.Stderr, "A browser sign-in can only read (metrics:read). To change anything, create an API key with the sync:write scope in the dashboard under Connections & API, then run 'shipfolio login' and paste it.")
+			} else {
+				fmt.Fprintln(a.Stderr, "This key lacks the scope for that. An admin can create a key with more scopes in the dashboard.")
+			}
 		case "reconnect_required":
 			fmt.Fprintln(a.Stderr, "Reconnect the Google account in the dashboard, then try again.")
 		}
@@ -208,6 +246,18 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 type config struct {
 	APIURL string `json:"api_url,omitempty"`
 	APIKey string `json:"api_key,omitempty"`
+	// OAuth holds a browser sign-in. At most one of APIKey and OAuth is set.
+	OAuth *oauthLogin `json:"oauth,omitempty"`
+}
+
+// oauthLogin is a browser sign-in: tokens from the API's OAuth server.
+type oauthLogin struct {
+	ClientID       string    `json:"client_id"`
+	AccessToken    string    `json:"access_token"`
+	RefreshToken   string    `json:"refresh_token"`
+	Expiry         time.Time `json:"expiry"`
+	TokenEndpoint  string    `json:"token_endpoint"`
+	RevokeEndpoint string    `json:"revocation_endpoint,omitempty"`
 }
 
 func (a *App) configPath() string {
@@ -275,7 +325,8 @@ func (a *App) newClient(c *common, key string, cfg config) *client.Client {
 	return &client.Client{BaseURL: a.apiURL(c, cfg), Key: key, HTTP: a.HTTP, UserAgent: "shipfolio-cli/" + Version}
 }
 
-// client returns a client with the key from the environment or the config.
+// client returns a client with the key from the environment or the
+// config, or else the saved browser sign-in.
 func (a *App) client(c *common) (*client.Client, error) {
 	cfg, err := a.loadConfig()
 	if err != nil {
@@ -285,10 +336,63 @@ func (a *App) client(c *common) (*client.Client, error) {
 	if key == "" {
 		key = cfg.APIKey
 	}
+	if key == "" && cfg.OAuth != nil {
+		cl := a.newClient(c, "", cfg)
+		cl.Token = a.oauthToken(*cfg.OAuth)
+		a.oauth = true
+		return cl, nil
+	}
 	if key == "" {
-		return nil, errors.New("no API key: run 'shipfolio login' or set SHIPFOLIO_API_KEY")
+		return nil, errors.New("no API key: run 'shipfolio login' (or 'shipfolio login --browser') or set SHIPFOLIO_API_KEY")
 	}
 	return a.newClient(c, key, cfg), nil
+}
+
+func (a *App) oauthClient() *client.OAuth {
+	return &client.OAuth{HTTP: a.HTTP, UserAgent: "shipfolio-cli/" + Version}
+}
+
+// oauthToken returns the access token, refreshing it when it has expired
+// or the server refused it. Refresh tokens rotate, so each new one is saved
+// at once: the old one no longer works.
+func (a *App) oauthToken(login oauthLogin) func(context.Context, bool) (string, error) {
+	var mu sync.Mutex
+	return func(ctx context.Context, renew bool) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !renew && login.AccessToken != "" && a.now().Before(login.Expiry.Add(-time.Minute)) {
+			return login.AccessToken, nil
+		}
+		if login.RefreshToken == "" || login.TokenEndpoint == "" {
+			return "", errors.New("the browser sign-in has expired; run 'shipfolio login --browser' again")
+		}
+		t, err := a.oauthClient().Refresh(ctx, login.TokenEndpoint, login.ClientID, login.RefreshToken)
+		if err != nil {
+			var ae *client.Error
+			if errors.As(err, &ae) && (ae.Code == "invalid_grant" || ae.Code == "invalid_client") {
+				return "", errors.New("the browser sign-in has expired or was disconnected; run 'shipfolio login --browser' again")
+			}
+			return "", fmt.Errorf("refresh the browser sign-in: %w", err)
+		}
+		login.AccessToken = t.AccessToken
+		login.Expiry = t.Expiry(a.now())
+		if t.RefreshToken != "" {
+			login.RefreshToken = t.RefreshToken
+		}
+		// Save into the file as it is now, so nothing else in it is lost.
+		cfg, err := a.loadConfig()
+		if err != nil {
+			return "", err
+		}
+		if cfg.OAuth != nil && cfg.OAuth.ClientID == login.ClientID {
+			saved := login
+			cfg.OAuth = &saved
+			if err := a.saveConfig(cfg); err != nil {
+				return "", fmt.Errorf("save the refreshed sign-in: %w", err)
+			}
+		}
+		return login.AccessToken, nil
+	}
 }
 
 // printRaw prints a response body as indented JSON.

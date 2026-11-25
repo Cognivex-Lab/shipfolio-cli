@@ -96,3 +96,39 @@ func TestQuotaIsNotRetried(t *testing.T) {
 		t.Fatalf("calls = %d, want 1", calls)
 	}
 }
+
+func TestTokenRenewedOnceAfter401(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer sfo_new" {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"status":"error","error":{"code":"unauthorized","message":"sign in","retryable":false}}`))
+			return
+		}
+		w.Write([]byte(`{"status":"ok","data":[]}`))
+	}))
+	defer srv.Close()
+	var renews []bool
+	c := &Client{BaseURL: srv.URL, Token: func(_ context.Context, renew bool) (string, error) {
+		renews = append(renews, renew)
+		if renew {
+			return "sfo_new", nil
+		}
+		return "sfo_old", nil
+	}}
+	if _, err := c.Do(context.Background(), "GET", "/v1/products", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] != "Bearer sfo_old" || len(renews) != 2 || !renews[1] {
+		t.Fatalf("seen=%v renews=%v", seen, renews)
+	}
+	// A token that is still refused after renewing is not renewed again.
+	c.Token = func(context.Context, bool) (string, error) { return "sfo_bad", nil }
+	seen = nil
+	_, err := c.Do(context.Background(), "GET", "/v1/products", nil, nil)
+	var ae *Error
+	if !errors.As(err, &ae) || ae.Code != "unauthorized" || len(seen) != 2 {
+		t.Fatalf("err=%v seen=%v", err, seen)
+	}
+}

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+
+	"github.com/Cognivex-Lab/shipfolio-cli/internal/client"
 )
 
 // none stands for a value Google did not report. It must never read as 0.
@@ -26,6 +28,7 @@ var metricOrder = []string{
 	"clicks", "impressions", "ctr", "avg_position",
 	"organic_clicks", "organic_impressions",
 	"sessions", "users", "engagement_rate", "key_events",
+	"bing_clicks", "bing_impressions", "bing_ctr", "bing_avg_position",
 }
 
 func sortMetrics(names []string) []string {
@@ -57,6 +60,10 @@ func metricTitle(name string) string {
 		return "POSITION"
 	case "engagement_rate":
 		return "ENGAGEMENT"
+	case "bing_ctr":
+		return "BING CTR"
+	case "bing_avg_position":
+		return "BING POSITION"
 	}
 	return strings.ToUpper(strings.ReplaceAll(name, "_", " "))
 }
@@ -68,9 +75,9 @@ func fmtMetric(name string, v *float64) string {
 		return none
 	}
 	switch name {
-	case "ctr", "engagement_rate":
+	case "ctr", "engagement_rate", "bing_ctr":
 		return strconv.FormatFloat(*v*100, 'f', 1, 64) + "%"
-	case "avg_position":
+	case "avg_position", "bing_avg_position":
 		return strconv.FormatFloat(*v, 'f', 1, 64)
 	}
 	return fmtCount(*v)
@@ -94,6 +101,15 @@ func fmtCount(v float64) string {
 	return b.String()
 }
 
+// fmtDelta formats an absolute change with its sign: +1,200 or -35.
+func fmtDelta(v float64) string {
+	s := fmtCount(v)
+	if v > 0 {
+		s = "+" + s
+	}
+	return s
+}
+
 // fmtChange formats a relative change such as -0.12 as "-12.0%".
 func fmtChange(v *float64) string {
 	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
@@ -113,6 +129,15 @@ func csvValue(v *float64) string {
 		return ""
 	}
 	return strconv.FormatFloat(*v, 'f', -1, 64)
+}
+
+// againstText describes the range a period is compared with.
+func againstText(p client.Period) string {
+	s := p.PrevStart + " to " + p.PrevEnd
+	if p.Compare == "year" {
+		s += " (a year earlier)"
+	}
+	return s
 }
 
 func productLabel(name, domain string) string {

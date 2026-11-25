@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 
 	"github.com/Cognivex-Lab/shipfolio-cli/internal/cli"
@@ -30,6 +31,7 @@ func main() {
 		Getenv:      os.Getenv,
 		Interactive: interactive,
 		ReadSecret:  readSecret,
+		OpenBrowser: openBrowser,
 	}
 	os.Exit(app.Run(ctx, os.Args[1:]))
 }
@@ -59,4 +61,22 @@ func readSecret(prompt string) (string, error) {
 		return "", err
 	}
 	return line, nil
+}
+
+// openBrowser opens a URL with the system's handler for it.
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
 }

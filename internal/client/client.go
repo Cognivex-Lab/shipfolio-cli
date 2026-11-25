@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,12 +20,17 @@ import (
 	"time"
 )
 
-// Client sends authenticated requests with an API key.
+// Client sends authenticated requests with an API key or an OAuth access
+// token.
 type Client struct {
 	BaseURL   string // e.g. https://api.shipfolio.ai
 	Key       string // sf_live_…
 	UserAgent string
 	HTTP      *http.Client
+	// Token, when set, supplies the bearer token instead of Key: an OAuth
+	// access token (sfo_…). After a 401 it is called once more with
+	// renew set, so it can refresh a token the server no longer accepts.
+	Token func(ctx context.Context, renew bool) (string, error)
 	// Sleep waits before retrying a rate-limited request. Tests replace it.
 	Sleep func(context.Context, time.Duration) error
 }
@@ -65,8 +71,22 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
+	token, err := c.bearer(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	renewed := false
 	for attempt := 0; ; attempt++ {
-		raw, wait, err := c.once(ctx, method, u, payload)
+		raw, wait, err := c.once(ctx, method, u, token, payload)
+		var ae *Error
+		if c.Token != nil && !renewed && errors.As(err, &ae) && ae.Status == http.StatusUnauthorized {
+			renewed = true
+			if token, err = c.bearer(ctx, true); err != nil {
+				return raw, err
+			}
+			attempt--
+			continue
+		}
 		if wait <= 0 || attempt >= maxRetries {
 			return raw, err
 		}
@@ -76,9 +96,16 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	}
 }
 
+func (c *Client) bearer(ctx context.Context, renew bool) (string, error) {
+	if c.Token == nil {
+		return c.Key, nil
+	}
+	return c.Token(ctx, renew)
+}
+
 // once sends one request. A positive wait means the request was rate
 // limited and may be retried after that long.
-func (c *Client) once(ctx context.Context, method, u string, payload []byte) ([]byte, time.Duration, error) {
+func (c *Client) once(ctx context.Context, method, u, token string, payload []byte) ([]byte, time.Duration, error) {
 	var rd io.Reader
 	if payload != nil {
 		rd = bytes.NewReader(payload)
@@ -88,8 +115,8 @@ func (c *Client) once(ctx context.Context, method, u string, payload []byte) ([]
 		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
-	if c.Key != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Key)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
@@ -211,6 +238,12 @@ type Summary struct {
 	Users          *float64 `json:"users"`
 	EngagementRate *float64 `json:"engagement_rate"`
 	KeyEvents      *float64 `json:"key_events"`
+	// Bing Webmaster Tools. Bing reports no position for site totals, so
+	// BingAvgPosition is set only on query and page rows.
+	BingClicks      *float64 `json:"bing_clicks"`
+	BingImpressions *float64 `json:"bing_impressions"`
+	BingCTR         *float64 `json:"bing_ctr"`
+	BingAvgPosition *float64 `json:"bing_avg_position"`
 }
 
 type Period struct {
@@ -219,6 +252,9 @@ type Period struct {
 	PrevStart string `json:"prev_start"`
 	PrevEnd   string `json:"prev_end"`
 	Days      int    `json:"days"`
+	// Compare is "previous" (the days just before) or "year" (the same
+	// days a year earlier).
+	Compare string `json:"compare"`
 }
 
 type ProductOverview struct {
@@ -290,4 +326,61 @@ type Resource struct {
 	ExternalID string `json:"external_id"`
 	Label      string `json:"label"`
 	Permission string `json:"permission"`
+}
+
+// Mover is one dimension value whose metric rose or fell between the
+// previous range and the current one.
+type Mover struct {
+	Value    string   `json:"value"`
+	Current  float64  `json:"current"`
+	Previous float64  `json:"previous"`
+	Delta    float64  `json:"delta"`
+	Change   *float64 `json:"change"` // relative; null when it was 0 before
+}
+
+type Movers struct {
+	ProductID string  `json:"product_id"`
+	Dimension string  `json:"dimension"`
+	Metric    string  `json:"metric"`
+	Period    Period  `json:"period"`
+	Gainers   []Mover `json:"gainers"`
+	Losers    []Mover `json:"losers"`
+}
+
+// Annotation is a dated note on the charts. An empty ProductID means it
+// applies to every product.
+type Annotation struct {
+	ID        string `json:"id"`
+	ProductID string `json:"product_id"`
+	Date      string `json:"date"`
+	Text      string `json:"text"`
+	CreatedBy string `json:"created_by"`
+}
+
+// ImportSite is a Search Console site that bulk import would turn into a
+// product, with the GA4 property whose web stream is on the same domain.
+type ImportSite struct {
+	ExternalID string            `json:"external_id"`
+	Domain     string            `json:"domain"`
+	Name       string            `json:"name"`
+	Exists     bool              `json:"exists"`
+	GA4        map[string]string `json:"ga4"` // external_id, label, connection_id; nil when none matched
+}
+
+type ImportPreview struct {
+	Sites    []ImportSite `json:"sites"`
+	Plan     string       `json:"plan"`
+	Limit    int          `json:"limit"`
+	Products int          `json:"products"`
+}
+
+type ImportedProduct struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Domain string `json:"domain"`
+	GA4    bool   `json:"ga4"`
+}
+
+type ImportResult struct {
+	Created []ImportedProduct `json:"created"`
 }
