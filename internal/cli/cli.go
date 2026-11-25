@@ -102,7 +102,7 @@ Environment:
   SHIPFOLIO_API_URL   API base URL (default ` + DefaultAPIURL + `)
   SHIPFOLIO_CONFIG    Config file path
 
-Create an API key in the dashboard under Connections & API.
+Create an API key in the dashboard on the API page.
 `
 
 // Run executes one command line and returns the process exit code.
@@ -192,7 +192,7 @@ func (a *App) report(err error) int {
 			}
 		case "insufficient_scope":
 			if a.oauth {
-				fmt.Fprintln(a.Stderr, "A browser sign-in can only read (metrics:read). To change anything, create an API key with the sync:write scope in the dashboard under Connections & API, then run 'shipfolio login' and paste it.")
+				fmt.Fprintln(a.Stderr, "A browser sign-in can only read (metrics:read). To change anything, create an API key with the sync:write scope in the dashboard on the API page, then run 'shipfolio login' and paste it.")
 			} else {
 				fmt.Fprintln(a.Stderr, "This key lacks the scope for that. An admin can create a key with more scopes in the dashboard.")
 			}

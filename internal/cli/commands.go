@@ -788,7 +788,7 @@ func (a *App) google(ctx context.Context, args []string) error {
 			return err
 		}
 		if len(resp.Data) == 0 {
-			fmt.Fprintln(a.Stdout, "No Google accounts are connected. Connect one in the dashboard under Connections & API.")
+			fmt.Fprintln(a.Stdout, "No Google accounts are connected. Connect one in the dashboard under Connections.")
 			return nil
 		}
 		tw := newTable(a.Stdout)

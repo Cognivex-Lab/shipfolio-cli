@@ -26,7 +26,7 @@ Prebuilt binaries for macOS, Linux and Windows are attached to each [release](ht
 
 ## Sign in
 
-Create an API key in the dashboard under **Connections & API**, then:
+Create an API key in the dashboard on the **API** page, then:
 
 ```sh
 shipfolio login            # paste the key at the prompt; it is not echoed
